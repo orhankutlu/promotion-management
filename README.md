@@ -12,6 +12,7 @@ load** (Scenario B).
 | Architecture decisions & trade-offs | [`ADR.md`](ADR.md) |
 | AI usage appendix (Form 5) | [`AI_APPENDIX.md`](AI_APPENDIX.md) |
 | Database schema (DDL) | [`db/schema.sql`](db/schema.sql) |
+| Form 5 AI Appendix | [`Form 5_AI_Appendix.pdf`](Form%205_AI_Appendix.pdf) |
 
 ## Measured locally (MacBook, Docker Postgres/Redis)
 
