@@ -1,0 +1,572 @@
+openapi: 3.1.0
+info:
+  title: ModaCo Promotion Management API
+  version: 1.0.0
+  description: |
+    Internal API for ModaCo's catalog and promotions.
+
+    **Money** is always integer minor units (`basePriceMinor: 19990` = 199.90). Product
+    responses also carry decimal strings (`basePrice`, `effectivePrice`) for display.
+
+    **Prices are precomputed.** Reads come from the `product_prices` table (and Redis in
+    front of it); promotion writes recompute it. A category-wide promotion answers `202`
+    immediately and prices propagate in the background worker (typically well under 2 s
+    for 50k products).
+
+    **Conflict rule:** a product-scoped promotion beats a category-scoped one. Two live
+    promotions on the same target may not overlap in time (`409 PROMOTION_OVERLAP`).
+
+    **Vendor ingestion** is a 3-step flow: `POST /ingestion/jobs` → `PUT` the CSV to the
+    returned presigned URL → `POST /ingestion/jobs/{id}/start`, then poll the job.
+tags:
+  - name: Products
+    description: Storefront reads (hot, cached) and product creation.
+  - name: Promotions
+    description: Create, assign and cancel promotions. Status is derived from the dates.
+  - name: Categories
+  - name: Ingestion
+    description: Bulk vendor CSV ingestion (Scenario A).
+  - name: Local-only
+    description: Stand-ins for cloud infrastructure; not part of the deployed API.
+
+paths:
+  /health:
+    get:
+      tags: [Local-only]
+      summary: Liveness + database check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { type: string, example: ok } } }
+
+  /categories:
+    get:
+      tags: [Categories]
+      summary: List categories
+      responses:
+        '200':
+          description: All categories (flat, no nesting), by name.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Category' } }
+    post:
+      tags: [Categories]
+      summary: Create a category
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100, example: Accessories }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '409':
+          description: A category with this name already exists (`DUPLICATE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /products:
+    get:
+      tags: [Products]
+      summary: List products sorted by effective price
+      description: |
+        Served from the precomputed price table with keyset pagination: pass the
+        `nextCursor` of one page as `cursor` to get the next. Cached per category version,
+        so a promotion change retires every cached page of that category at once.
+      parameters:
+        - { name: categoryId, in: query, schema: { type: string, format: uuid } }
+        - { name: sort, in: query, schema: { type: string, enum: [price_asc, price_desc], default: price_asc } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: cursor, in: query, schema: { type: string }, description: '`nextCursor` from the previous page.' }
+      responses:
+        '200':
+          description: One page of products.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Product' } }
+                  nextCursor: { type: [string, 'null'], description: null on the last page }
+        '400':
+          description: Invalid query or malformed cursor (`INVALID_CURSOR`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    post:
+      tags: [Products]
+      summary: Create a product
+      description: |
+        Priced in the same transaction by the promotion resolver, so a product created
+        while a category sale is live is discounted from its very first read.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sku, name, categoryId, basePriceMinor]
+              properties:
+                sku: { type: string, minLength: 1, maxLength: 64, example: SCARF-001 }
+                name: { type: string, minLength: 1, maxLength: 200, example: Silk scarf }
+                categoryId: { type: string, format: uuid }
+                basePriceMinor: { type: integer, minimum: 0, maximum: 2147483647, example: 49990 }
+                stockQuantity: { type: integer, minimum: 0, maximum: 2147483647, default: 0, example: 25 }
+      responses:
+        '201':
+          description: Created, with its effective price.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '409':
+          description: SKU already exists (`DUPLICATE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Category does not exist (`INVALID_REFERENCE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /products/{id}:
+    get:
+      tags: [Products]
+      summary: Get one product (highest-traffic endpoint)
+      description: Cached per product and stamped with its category version.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The product with its current effective price.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /promotions:
+    get:
+      tags: [Promotions]
+      summary: List promotions, newest first
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200':
+          description: Promotions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Promotion' } }
+    post:
+      tags: [Promotions]
+      summary: Create a promotion
+      description: |
+        Without `target` the promotion is a `DRAFT`; assign it later.
+        - Product scope: price recomputed inline → `201`, `pricePropagation: COMPLETED`.
+        - Category scope: control-plane write only → `202`, `pricePropagation: QUEUED`
+          (or `DEFERRED` if the queue was unreachable; the sweeper re-drives it).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromotionInput' }
+            examples:
+              categorySale:
+                summary: 50% off a whole category
+                value:
+                  name: 50% Off All Accessories
+                  discountType: PERCENTAGE
+                  value: 50
+                  endsAt: '2026-12-31T00:00:00Z'
+                  target: { scope: CATEGORY, categoryId: 00000000-0000-0000-0000-000000000000 }
+              productFixed:
+                summary: 25.00 off one product
+                value:
+                  name: 25 off the silk scarf
+                  discountType: FIXED
+                  value: 2500
+                  endsAt: '2026-12-31T00:00:00Z'
+                  target: { scope: PRODUCT, productId: 00000000-0000-0000-0000-000000000000 }
+              draft:
+                summary: Draft (assign later)
+                value: { name: Weekend deal, discountType: PERCENTAGE, value: 15, endsAt: '2026-12-31T00:00:00Z' }
+      responses:
+        '201':
+          description: Created (product scope applied inline, or draft).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        '202':
+          description: Created; category prices are propagating in the background.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        '400':
+          description: Invalid body, dates or value (`VALIDATION_FAILED`, `INVALID_DATES`, `INVALID_VALUE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { $ref: '#/components/responses/Overlap' }
+        '422':
+          description: Target product/category does not exist (`INVALID_REFERENCE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /promotions/{id}:
+    get:
+      tags: [Promotions]
+      summary: Get a promotion
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The promotion.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /promotions/{id}/assign:
+    post:
+      tags: [Promotions]
+      summary: Assign a draft promotion to a product or category
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Target' }
+      responses:
+        '200':
+          description: Assigned; see `pricePropagation`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Not a draft (`NOT_ASSIGNABLE`) or overlaps another promotion (`PROMOTION_OVERLAP`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Target does not exist (`INVALID_REFERENCE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /promotions/{id}/cancel:
+    post:
+      tags: [Promotions]
+      summary: Cancel a promotion
+      description: Prices revert (inline for product scope, via the worker for category scope).
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Already cancelled or expired (`NOT_CANCELLABLE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /ingestion/jobs:
+    post:
+      tags: [Ingestion]
+      summary: 1. Create an ingestion job and get a presigned upload URL
+      description: |
+        The CSV never passes through the API: upload it with a `PUT` to `upload.url`
+        (e.g. `curl -T vendor.csv "<url>"`). The URL is valid for 15 minutes and is
+        create-only — a second upload to the same job is rejected.
+
+        CSV columns: `sku,name,category,vendor_cost,list_price,stock` (`list_price` optional).
+      responses:
+        '201':
+          description: Job created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobId: { type: string, format: uuid }
+                  upload:
+                    type: object
+                    properties:
+                      method: { type: string, example: PUT }
+                      url: { type: string, example: 'http://localhost:3100/blob-upload?key=uploads%2F...&expires=...&sig=...' }
+                      expiresInSeconds: { type: integer, example: 900 }
+                  next: { type: string }
+
+  /ingestion/jobs/{id}/start:
+    post:
+      tags: [Ingestion]
+      summary: 3. Start processing the uploaded file
+      description: Stands in for the storage "object created" event. Idempotent.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          description: Dispatching; poll the job for progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestionJob' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Nothing uploaded yet (`UPLOAD_MISSING`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /ingestion/jobs/{id}:
+    get:
+      tags: [Ingestion]
+      summary: Job status and progress
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Progress, sample rejected rows and dead-lettered chunks.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestionJob' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /ingestion/jobs/{id}/retry-failed:
+    post:
+      tags: [Ingestion]
+      summary: Re-drive a failed dispatcher and dead-lettered chunks
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '202':
+          description: Number of re-queued messages.
+          content:
+            application/json:
+              schema: { type: object, properties: { requeued: { type: integer } } }
+
+  /blob-upload:
+    put:
+      tags: [Local-only]
+      summary: 2. Upload the CSV (presigned URL target)
+      description: |
+        Local stand-in for a presigned S3 / Azure Blob PUT. Use the full URL returned by
+        `POST /ingestion/jobs`; the body is streamed to storage, never buffered.
+      parameters:
+        - { name: key, in: query, required: true, schema: { type: string } }
+        - { name: expires, in: query, required: true, schema: { type: integer } }
+        - { name: sig, in: query, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema: { type: string }
+            example: |
+              sku,name,category,vendor_cost,list_price,stock
+              V-1,Leather bag,Bags,10.00,,3
+      responses:
+        '200':
+          description: Stored.
+          content:
+            application/json:
+              schema: { type: object, properties: { key: { type: string }, bytes: { type: integer } } }
+        '403':
+          description: Bad or expired signature (`BAD_SIGNATURE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: A file was already uploaded for this job (`ALREADY_UPLOADED`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    NotFound:
+      description: Not found (`NOT_FOUND`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: Request failed validation (`VALIDATION_FAILED`); `details` lists the issues.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Overlap:
+      description: Overlaps another live promotion on the same target (`PROMOTION_OVERLAP`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: PROMOTION_OVERLAP }
+            message: { type: string }
+            details: {}
+
+    Category:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Accessories }
+        createdAt: { type: string, format: date-time }
+
+    Product:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string, example: SCARF-001 }
+        name: { type: string, example: Silk scarf }
+        categoryId: { type: string, format: uuid }
+        categoryName: { type: string, example: Accessories }
+        stockQuantity: { type: integer, example: 25 }
+        basePriceMinor: { type: integer, example: 49990 }
+        effectivePriceMinor: { type: integer, example: 24995 }
+        basePrice: { type: string, example: '499.90' }
+        effectivePrice: { type: string, example: '249.95' }
+        promotion:
+          description: The promotion that produced `effectivePrice`, if any.
+          oneOf:
+            - type: 'null'
+            - type: object
+              properties:
+                id: { type: string, format: uuid }
+                name: { type: string, example: 50% Off All Accessories }
+                discountType: { type: string, enum: [PERCENTAGE, FIXED] }
+                value: { type: number, example: 50, description: Percent for PERCENTAGE, minor units for FIXED. }
+                endsAt: { type: string, format: date-time }
+        priceValidUntil:
+          type: [string, 'null']
+          format: date-time
+          description: When this price changes next (a promotion starts or ends).
+
+    Target:
+      oneOf:
+        - type: object
+          required: [scope, productId]
+          properties:
+            scope: { const: PRODUCT }
+            productId: { type: string, format: uuid }
+        - type: object
+          required: [scope, categoryId]
+          properties:
+            scope: { const: CATEGORY }
+            categoryId: { type: string, format: uuid }
+      discriminator: { propertyName: scope }
+
+    PromotionInput:
+      type: object
+      required: [name, discountType, value, endsAt]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        discountType: { type: string, enum: [PERCENTAGE, FIXED] }
+        value:
+          type: number
+          exclusiveMinimum: 0
+          description: 'PERCENTAGE: percent in (0, 100], up to 2 decimals (e.g. 12.5). FIXED: minor units off (2500 = 25.00).'
+        startsAt: { type: string, format: date-time, description: Defaults to now. }
+        endsAt: { type: string, format: date-time }
+        target: { $ref: '#/components/schemas/Target' }
+
+    Promotion:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        discountType: { type: string, enum: [PERCENTAGE, FIXED] }
+        value: { type: number, example: 50 }
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        cancelledAt: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [DRAFT, SCHEDULED, ACTIVE, EXPIRED, CANCELLED] }
+        target:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Target'
+        pricePropagation:
+          type: string
+          enum: [COMPLETED, QUEUED, DEFERRED, NONE]
+          description: Only on write responses.
+
+    IngestionJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [AWAITING_UPLOAD, DISPATCHING, PROCESSING, COMPLETED, COMPLETED_WITH_ERRORS, FAILED]
+        error: { type: [string, 'null'], description: Why the dispatcher gave up (status FAILED). }
+        progressPercent: { type: [integer, 'null'] }
+        rows:
+          type: object
+          properties:
+            total: { type: [integer, 'null'] }
+            ingested: { type: integer }
+            rejected: { type: integer }
+        chunks:
+          type: object
+          properties:
+            total: { type: [integer, 'null'] }
+            done: { type: integer }
+            failed: { type: integer }
+        dispatcher:
+          type: object
+          properties:
+            done: { type: boolean }
+            rowsDispatched: { type: integer }
+            invocations: { type: integer }
+        sampleRowErrors:
+          type: array
+          items:
+            type: object
+            properties:
+              row: { type: integer, example: 2 }
+              sku: { type: [string, 'null'] }
+              reason: { type: string, example: 'validate: invalid vendor_cost' }
+        failedChunks:
+          type: array
+          items:
+            type: object
+            properties:
+              chunkIndex: { type: integer }
+              attempts: { type: integer }
+              lastError: { type: [string, 'null'] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }

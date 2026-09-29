@@ -1,0 +1,156 @@
+// Prisma models mirror prisma/migrations/*/migration.sql, which is the source of
+// truth (it holds the EXCLUDE/CHECK constraints Prisma cannot express).
+// Apply with `prisma migrate deploy`; do not use `migrate dev` to regenerate.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [btree_gist]
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED
+}
+
+enum PromotionScope {
+  PRODUCT
+  CATEGORY
+}
+
+enum IngestionJobStatus {
+  AWAITING_UPLOAD
+  DISPATCHING
+  PROCESSING
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+enum ChunkStatus {
+  PENDING
+  DONE
+  FAILED
+}
+
+model Category {
+  id         String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name       String         @unique
+  createdAt  DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  products   Product[]
+  promotions Promotion[]
+  prices     ProductPrice[]
+
+  @@map("categories")
+}
+
+model Product {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sku            String        @unique
+  name           String
+  categoryId     String        @map("category_id") @db.Uuid
+  basePriceMinor Int           @map("base_price_minor")
+  stockQuantity  Int           @default(0) @map("stock_quantity")
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime      @default(now()) @map("updated_at") @db.Timestamptz(6)
+  category       Category      @relation(fields: [categoryId], references: [id])
+  price          ProductPrice?
+  promotions     Promotion[]
+
+  @@index([categoryId, id], map: "products_category_id_id_idx")
+  @@map("products")
+}
+
+model Promotion {
+  id               String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name             String
+  discountType     DiscountType    @map("discount_type")
+  value            Int
+  startsAt         DateTime        @map("starts_at") @db.Timestamptz(6)
+  endsAt           DateTime        @map("ends_at") @db.Timestamptz(6)
+  cancelledAt      DateTime?       @map("cancelled_at") @db.Timestamptz(6)
+  scope            PromotionScope?
+  targetProductId  String?         @map("target_product_id") @db.Uuid
+  targetCategoryId String?         @map("target_category_id") @db.Uuid
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  pricingRev       Int             @default(1) @map("pricing_rev")
+  pricingSyncedRev Int             @default(0) @map("pricing_synced_rev")
+  pricingChangedAt DateTime        @default(now()) @map("pricing_changed_at") @db.Timestamptz(6)
+  targetProduct    Product?        @relation(fields: [targetProductId], references: [id])
+  targetCategory   Category?       @relation(fields: [targetCategoryId], references: [id])
+  prices           ProductPrice[]
+
+  @@map("promotions")
+}
+
+model ProductPrice {
+  productId           String     @id @map("product_id") @db.Uuid
+  categoryId          String     @map("category_id") @db.Uuid
+  basePriceMinor      Int        @map("base_price_minor")
+  effectivePriceMinor Int        @map("effective_price_minor")
+  promotionId         String?    @map("promotion_id") @db.Uuid
+  validUntil          DateTime?  @map("valid_until") @db.Timestamptz(6)
+  updatedAt           DateTime   @default(now()) @map("updated_at") @db.Timestamptz(6)
+  product             Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  category            Category   @relation(fields: [categoryId], references: [id])
+  promotion           Promotion? @relation(fields: [promotionId], references: [id])
+
+  @@index([categoryId, effectivePriceMinor, productId], map: "product_prices_category_price_idx")
+  @@index([effectivePriceMinor, productId], map: "product_prices_price_idx")
+  @@map("product_prices")
+}
+
+model IngestionJob {
+  id                  String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  status              IngestionJobStatus @default(AWAITING_UPLOAD)
+  blobKey             String             @map("blob_key")
+  rowsTotal           Int                @default(0) @map("rows_total")
+  rowsIngested        Int                @default(0) @map("rows_ingested")
+  rowsRejected        Int                @default(0) @map("rows_rejected")
+  chunksTotal         Int                @default(0) @map("chunks_total")
+  chunksDone          Int                @default(0) @map("chunks_done")
+  chunksFailed        Int                @default(0) @map("chunks_failed")
+  csvHeader           String[]           @map("csv_header")
+  dispatchByteOffset  BigInt             @default(0) @map("dispatch_byte_offset")
+  dispatchRowIndex    Int                @default(0) @map("dispatch_row_index")
+  dispatchInvocations Int                @default(0) @map("dispatch_invocations")
+  dispatchDone        Boolean            @default(false) @map("dispatch_done")
+  lastError           String?            @map("last_error")
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime           @default(now()) @map("updated_at") @db.Timestamptz(6)
+  chunks              IngestionChunk[]
+  rowErrors           IngestionRowError[]
+
+  @@map("ingestion_jobs")
+}
+
+model IngestionChunk {
+  jobId      String       @map("job_id") @db.Uuid
+  chunkIndex Int          @map("chunk_index")
+  blobKey    String       @map("blob_key")
+  rowCount   Int          @map("row_count")
+  status     ChunkStatus  @default(PENDING)
+  attempts   Int          @default(0)
+  lastError  String?      @map("last_error")
+  updatedAt  DateTime     @default(now()) @map("updated_at") @db.Timestamptz(6)
+  job        IngestionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@id([jobId, chunkIndex])
+  @@map("ingestion_chunks")
+}
+
+model IngestionRowError {
+  jobId     String       @map("job_id") @db.Uuid
+  rowNumber Int          @map("row_number")
+  sku       String?
+  reason    String
+  job       IngestionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@id([jobId, rowNumber])
+  @@map("ingestion_row_errors")
+}
